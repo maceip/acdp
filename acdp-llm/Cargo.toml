@@ -1,0 +1,82 @@
+[package]
+name = "acdp-llm"
+version = "0.1.0"
+edition = "2021"
+description = "LLM integration for assist-mcp with LiteRT-LM and DSPy-RS"
+
+[dependencies]
+# Core dependencies (from workspace)
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+
+# LiteRT-LM C bindings
+libc = "0.2"
+
+# Async and streaming
+tokio-stream = { workspace = true }
+
+# Error handling and validation
+derive_more = { version = "1.0", features = ["display", "error", "from"] }
+
+# Config and paths
+toml = { workspace = true }
+dirs = "5.0"
+
+# HTTP client for model downloads
+reqwest = { version = "0.11", features = ["json", "stream"] }
+futures-util = "0.3"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite", "migrate", "chrono"] }
+
+# Metrics
+metrics = "0.22"
+
+# DSPy-RS
+dspy-rs = "0.7.1"
+
+# Internal dependencies
+acdp-common = { path = "../acdp-common" }
+acdp-core = { path = "../acdp-core" }
+async-trait = { workspace = true }
+
+[build-dependencies]
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[features]
+default = []
+debug-bindings = []
+
+[lib]
+name = "acdp_llm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llm-test"
+path = "src/bin/test.rs"
+
+[[bin]]
+name = "test_semantic_routing"
+path = "src/bin/test_semantic_routing.rs"
+
+[[bin]]
+name = "test_litert_direct"
+path = "src/bin/test_litert_direct.rs"
+
+[[example]]
+name = "chat"
+path = "examples/chat.rs"
+
+[[example]]
+name = "test_features"
+path = "examples/test_features.rs"

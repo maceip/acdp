@@ -1,0 +1,39 @@
+[package]
+name = "assist-acdp-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Test utilities
+tokio-test = "0.4"
+tempfile = "3.8"
+wiremock = "0.6"
+assert_matches = "1.5"
+tracing-test = "0.2"
+rand = "0.8"
+
+# HTTP client for testing
+reqwest = { version = "0.12", features = ["json", "stream"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+
+# Internal dependencies
+acdp-common = { path = "../acdp-common" }
+acdp-core = { path = "../acdp-core" }
+acdp-transport = { path = "../acdp-transport" }
+acdp-llm = { path = "../acdp-llm" }
+acdp-tui = { path = "../acdp-tui" }
+
+[lib]
+name = "assist_mcp_tests"
+path = "lib.rs"

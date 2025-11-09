@@ -1,0 +1,87 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+
+# Logs
+logs/
+*.log
+
+# Python
+src/__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+result/
+dist/
+build/
+
+# Test artifacts
+*.profraw
+coverage/
+lcov.info
+
+# Temporary files
+*.tmp
+*.temp
+.z.sh
+
+# Model files (if large)
+*.llm
+*.model
+models/
+*.bin
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.backup
+
+# Generated files
+bindings/
+OUT_DIR/
+
+# Documentation build
+docs/build/
+docs/_build/
+
+# Local development
+.local/
+local/
+
+# Test outputs
+test-results/
+test-output/

@@ -1,0 +1,50 @@
+[package]
+name = "acdp-transport"
+version = "0.2.0"
+edition = "2021"
+
+[package.metadata.dist]
+dist = false
+
+[[bin]]
+name = "acdp-transport"
+path = "src/main.rs"
+
+[[bin]]
+name = "http-sse-proxy"
+path = "src/bin/http_sse_proxy.rs"
+
+[[bin]]
+name = "litert-mcp-server"
+path = "src/bin/litert_mcp_server.rs"
+
+[dependencies]
+acdp-common = { path = "../acdp-common" }
+acdp-core = { path = "../acdp-core" }
+acdp-llm = { path = "../acdp-llm", optional = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = "0.8"
+async-trait = { workspace = true }
+futures = { workspace = true }
+axum = { version = "0.7", features = ["macros"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+futures-util = "0.3"
+
+[features]
+default = ["llm"]
+llm = ["acdp-llm"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.8"
+assert_matches = "1.5"

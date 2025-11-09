@@ -1,0 +1,1956 @@
+use anyhow::{anyhow, Context, Result};
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::env;
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{
+    broadcast::Receiver as BroadcastReceiver,
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    Mutex as AsyncMutex,
+};
+use tracing::{debug, error, info, warn};
+
+// MCP Gateway integration
+use acdp_common::ipc::IpcClient;
+use acdp_common::types::{LogEntry, ProxySession, SessionId};
+use acdp_common::{IpcMessage, SessionMetrics};
+use acdp_core::{
+    messages::Implementation as McpImplementation, transport::TransportConfig, McpClient,
+    ServerInfo,
+};
+
+use crate::components::{
+    ActivityItem, Client, DiagnosticsData, SemanticPrediction, Server, ServerType,
+};
+use crate::config::Config;
+use crate::events::{Event, EventHandler};
+use crate::ipc_handler::{AppStateUpdate, IpcHandler};
+use crate::llm_responses_panel::LlmResponse;
+use crate::acdp_server::{self, AppState as McpAppState, ClientUpdate};
+// Note: pseudo_demo module removed - demo mode uses sample data instead
+use crate::ui::{NavigationContext, UI};
+use acdp_common::types::ProxyId;
+use acdp_llm::{GenerationEvent, GenerationMetrics, GenerationRequest, LlmEvent, LlmService};
+use uuid::Uuid;
+
+#[derive(Debug)]
+struct ActiveGeneration {
+    prompt: String,
+    accumulated: String,
+    activity_index: usize,
+}
+
+#[derive(Debug)]
+enum UiGenerationEvent {
+    Token { id: u64, token: String },
+    Completed { id: u64, metrics: GenerationMetrics },
+}
+
+#[derive(Clone)]
+pub struct GatewayConnection {
+    client: Arc<AsyncMutex<McpClient>>,
+}
+
+/// Main application state
+pub struct App {
+    /// UI state management
+    pub ui: UI,
+    /// Event handler for user input
+    pub events: EventHandler,
+    /// Connected clients (AI assistants, tools)
+    pub clients: HashMap<String, Client>,
+    /// Available servers (backend services)
+    pub servers: HashMap<String, Server>,
+    /// Activity feed items
+    pub activities: Vec<ActivityItem>,
+    /// Current query input
+    pub query_input: String,
+    /// Application running state
+    pub running: bool,
+    /// Last update time
+    pub last_update: Instant,
+    /// Loaded configuration (LLM + UI preferences)
+    pub config: Config,
+
+    // MCP Gateway integration
+    /// MCP client for gateway communication
+    pub gateway_client: Option<GatewayConnection>,
+    /// IPC client for communicating with proxies
+    pub ipc_client: Option<Arc<AsyncMutex<IpcClient>>>,
+    /// Pending query correlations
+    pub pending_queries: HashMap<uuid::Uuid, (String, usize)>, // correlation_id -> (query, activity_index)
+    /// Active proxy sessions
+    pub proxy_sessions: HashMap<SessionId, ProxySession>,
+    /// Real-time activity log
+    pub activity_log: Vec<LogEntry>,
+    /// Connected MCP servers info
+    pub mcp_servers: HashMap<String, ServerInfo>,
+    /// Currently selected proxy ID for routing mode changes (when multiple proxies exist)
+    pub selected_proxy_id: Option<String>,
+
+    // LLM service integration
+    /// Shared LLM service facade
+    pub llm_service: Option<Arc<LlmService>>,
+    /// Background task handle for model warm-up
+    _llm_init_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Broadcast receiver for service events
+    llm_event_receiver: Option<BroadcastReceiver<LlmEvent>>,
+    /// Channel for UI generation updates
+    generation_tx: UnboundedSender<UiGenerationEvent>,
+    generation_rx: UnboundedReceiver<UiGenerationEvent>,
+    /// Monotonic identifier for in-flight generations
+    next_generation_id: u64,
+    /// Active generation bookkeeping
+    active_generations: HashMap<u64, ActiveGeneration>,
+
+    /// Current diagnostics data
+    pub diagnostics: DiagnosticsData,
+    /// Latest semantic routing prediction (shown when in semantic/hybrid mode)
+    pub semantic_prediction: SemanticPrediction,
+    /// IPC handler for gateway integration
+    ipc_update_receiver: tokio::sync::mpsc::Receiver<AppStateUpdate>,
+    /// IPC handler instance
+    _ipc_handler: IpcHandler,
+
+    // MCP Server integration
+    /// MCP server listener (optional, enabled via config)
+    pub mcp_server: Option<Arc<acdp_server::McpServerListener>>,
+    /// MCP server state for client connections
+    mcp_server_state: Option<acdp_server::AppState>,
+
+    // Auto-spawned process tracking
+    /// Auto-spawned HTTP-SSE proxy child process
+    auto_proxy_child: Option<tokio::process::Child>,
+    /// URL of the auto-spawned MCP server (if any)
+    auto_mcp_server_url: Option<String>,
+}
+
+impl App {
+    /// Create a new application instance
+    pub async fn new() -> Result<Self> {
+        debug!("Initializing MCP TUI application");
+
+        let ui = UI::new();
+        let events = EventHandler::new();
+
+        // Load config (lightweight operation)
+        let config = Config::load().unwrap_or_default();
+        let mut diagnostics = DiagnosticsData::default();
+        diagnostics.routing_mode = Some(config.llm_config().llm.routing_mode.clone());
+
+        // Channel used to surface streamed generation events into the UI thread
+        let (generation_tx, generation_rx) = unbounded_channel();
+
+        // Create shared LLM service facade (always attempt to load)
+        // Errors are handled gracefully - service will be None if LiteRT unavailable
+        // Note: stderr is already suppressed in main.rs for LiteRT logs
+        let llm_service = match LlmService::new(config.llm_config().clone()).await {
+            Ok(service) => {
+                info!("LLM service initialized successfully");
+                Some(service)
+            }
+            Err(e) => {
+                // Log but don't fail - TUI works fine without LiteRT
+                debug!("LLM service not available: {}", e);
+                None
+            }
+        };
+        let llm_init_handle = llm_service.as_ref().map(|service| {
+            let service_clone = service.clone();
+            tokio::spawn(async move {
+                if let Err(e) = service_clone.ensure_model_available().await {
+                    warn!("Failed to ensure model available: {}", e);
+                    return;
+                }
+
+                if let Err(e) = service_clone.warm_session().await {
+                    warn!("Failed to warm session: {}", e);
+                }
+            })
+        });
+        let llm_event_receiver = llm_service
+            .as_ref()
+            .map(|service| service.subscribe_events());
+
+        let gateway_client = match Self::initialize_gateway_client().await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!("Failed to initialize gateway client: {}", e);
+                None
+            }
+        };
+
+        // Initialize IPC handler for gateway integration
+        // Default socket path (can be made configurable later)
+        let socket_path =
+            std::env::var("MCP_IPC_SOCKET").unwrap_or_else(|_| "/tmp/mcp-monitor.sock".to_string());
+
+        let (ipc_handler, ipc_receiver) = match IpcHandler::new(socket_path).await {
+            Ok((handler, receiver)) => {
+                info!("IPC handler initialized successfully");
+                (handler, receiver)
+            }
+            Err(e) => {
+                warn!("Failed to initialize IPC handler: {}. TUI will run without gateway integration.", e);
+                // Create a dummy handler and receiver - need separate receiver instances
+                let (tx1, rx1) = tokio::sync::mpsc::channel(1);
+                let (tx2, rx2) = tokio::sync::mpsc::channel(1);
+                drop(tx1); // Close immediately so receiver will never receive
+                drop(tx2); // Close immediately so receiver will never receive
+                (
+                    IpcHandler {
+                        _message_receiver: rx1, // Dummy receiver for handler
+                        server_handle: None,
+                    },
+                    rx2,
+                ) // Separate dummy receiver for App
+            }
+        };
+
+        // Initialize MCP server if enabled and capture URL for auto-proxy
+        let auto_mcp_server_url = if config.enable_mcp_server() {
+            Some(format!("http://{}/sse", config.mcp_server_bind_addr()))
+        } else {
+            None
+        };
+
+        let (mcp_server, mcp_server_state) = if config.enable_mcp_server() {
+            let bind_addr = config.mcp_server_bind_addr();
+            let backend_command = config.backend_command().ok().flatten().unwrap_or_default();
+            let (update_tx, _update_rx) = unbounded_channel();
+
+            #[cfg(feature = "llm")]
+            let routing_mode = config
+                .llm_config()
+                .llm
+                .routing_mode()
+                .unwrap_or_else(|_| acdp_llm::RoutingMode::Bypass);
+
+            let app_state = Arc::new(AsyncMutex::new(acdp_server::AppStateInner {
+                clients: HashMap::new(),
+                update_tx: Some(update_tx),
+                backend_command,
+                backend_url: None,
+                backend_transport: None,
+                max_clients: 100,
+                connection_timeout_secs: 30,
+                auto_restart_backend: true,
+                metrics: Default::default(),
+                started_at: Instant::now(),
+                last_metrics_update: Instant::now(),
+                last_request_count: 0,
+                #[cfg(feature = "llm")]
+                llm_service: llm_service.clone(),
+                #[cfg(feature = "llm")]
+                routing_mode: {
+                    #[cfg(feature = "llm")]
+                    {
+                        routing_mode
+                    }
+                    #[cfg(not(feature = "llm"))]
+                    {
+                        acdp_llm::RoutingMode::Bypass
+                    }
+                },
+            }));
+
+            match acdp_server::McpServerListener::new(&bind_addr, app_state.clone()).await {
+                Ok(server) => {
+                    let server = Arc::new(server);
+                    let server_clone = server.clone();
+
+                    // Spawn the accept loop in background
+                    tokio::spawn(async move {
+                        if let Err(e) = server_clone.run().await {
+                            error!("MCP server error: {}", e);
+                        }
+                    });
+
+                    info!("MCP server started on {}", bind_addr);
+                    (Some(server), Some(app_state))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to start MCP server: {}. Continuing without MCP server mode.",
+                        e
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        // Auto-spawn HTTP-SSE proxy if MCP server is running
+        let auto_proxy_child = if let Some(ref mcp_url) = auto_mcp_server_url {
+            match Self::spawn_auto_proxy(mcp_url).await {
+                Ok(child) => {
+                    info!("Auto-spawned HTTP-SSE proxy connected to {}", mcp_url);
+                    Some(child)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to auto-spawn proxy: {}. Continuing without auto-proxy.",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ui,
+            events,
+            clients: HashMap::new(),
+            servers: HashMap::new(),
+            activities: Vec::new(),
+            query_input: String::new(),
+            running: true,
+            last_update: Instant::now(),
+            config,
+
+            // MCP Gateway integration
+            gateway_client,
+            ipc_client: None, // Will be set up when proxy connects
+            pending_queries: HashMap::new(),
+            proxy_sessions: HashMap::new(),
+            activity_log: Vec::new(),
+            mcp_servers: HashMap::new(),
+            selected_proxy_id: None,
+
+            // LLM service integration
+            llm_service,
+            _llm_init_handle: llm_init_handle,
+            llm_event_receiver,
+            generation_tx,
+            generation_rx,
+            next_generation_id: 0,
+            active_generations: HashMap::new(),
+
+            // Diagnostics
+            diagnostics,
+            semantic_prediction: SemanticPrediction::default(),
+            // IPC handler
+            ipc_update_receiver: ipc_receiver,
+            _ipc_handler: ipc_handler,
+
+            // MCP Server integration
+            mcp_server,
+            mcp_server_state,
+
+            // Auto-spawned processes
+            auto_proxy_child,
+            auto_mcp_server_url,
+        })
+    }
+
+    /// Run the main application loop
+    pub async fn run(&mut self) -> Result<()> {
+        debug!("Starting application run loop");
+
+        // Setup terminal (must be done synchronously for instant launch)
+        enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+
+        // No sample/demo data - only show real proxies/servers from IPC
+
+        // Note: Model initialization is already running in background task
+        // started in App::new(). The TUI shows immediately while models load.
+
+        // Track if we need to redraw
+        let mut needs_redraw = true;
+
+        // Main event loop - optimized for low latency
+        while self.running {
+            // Process all pending events without blocking (batch processing)
+            let mut events_processed = 0;
+            loop {
+                match self.events.try_next(Duration::from_millis(0)).await {
+                    Ok(Some(event)) => {
+                        if let Err(e) = self.handle_event(event).await {
+                            warn!("Error handling event: {}", e);
+                            self.activities.push(ActivityItem {
+                                timestamp: chrono::Utc::now(),
+                                client: "System".to_string(),
+                                server: "TUI".to_string(),
+                                action: format!("Error: {}", e),
+                                status: crate::components::ActivityStatus::Failed,
+                                metrics: None,
+                            });
+                        }
+                        events_processed += 1;
+                        needs_redraw = true;
+                    }
+                    Ok(None) => break, // No more events
+                    Err(e) => {
+                        warn!("Event error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Check if any state updates are pending (only call update_state once)
+            let has_ipc_updates = !self.ipc_update_receiver.is_empty();
+            let has_generation_updates =
+                !self.active_generations.is_empty() && !self.generation_rx.is_empty();
+            let has_llm_events = self
+                .llm_event_receiver
+                .as_ref()
+                .map(|r| !r.is_empty())
+                .unwrap_or(false);
+
+            if has_ipc_updates || has_generation_updates || has_llm_events {
+                self.update_state().await;
+                needs_redraw = true;
+            }
+
+            // Only redraw if something changed
+            if needs_redraw {
+                terminal.draw(|f| {
+                    self.ui.draw(
+                        f,
+                        &self.clients,
+                        &self.servers,
+                        &self.activities,
+                        &self.query_input,
+                        &self.diagnostics,
+                        self.selected_proxy_id.as_ref(),
+                    );
+                })?;
+                needs_redraw = false;
+            }
+
+            // If no events were processed and no state changes, sleep briefly to avoid busy loop
+            if events_processed == 0
+                && !(has_ipc_updates || has_generation_updates || has_llm_events)
+            {
+                tokio::time::sleep(Duration::from_millis(16)).await;
+            }
+        }
+
+        // Clean up auto-spawned processes
+        if let Some(mut child) = self.auto_proxy_child.take() {
+            info!("Shutting down auto-spawned proxy");
+            if let Err(e) = child.kill().await {
+                warn!("Failed to kill auto-proxy process: {}", e);
+            } else {
+                info!("Auto-proxy process terminated");
+            }
+        }
+
+        // MCP server cleanup is handled by Arc drop when app_state goes out of scope
+
+        // Restore terminal
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+
+        Ok(())
+    }
+
+    /// Handle user input events
+    async fn handle_event(&mut self, event: Event) -> Result<()> {
+        debug!("Handling event: {:?}", event);
+
+        // Navigation context for current state
+        let nav_ctx = NavigationContext {
+            server_len: self.servers.len(),
+            activity_len: self.activities.len(),
+        };
+
+        // Handle non-navigation events
+        match event {
+            Event::Quit => {
+                self.running = false;
+            }
+            Event::Escape => {
+                // If in settings, exit back to main tabs
+                if self.ui.get_focus() == crate::components::FocusArea::Settings {
+                    self.ui.close_settings();
+                } else if self.ui.get_focus() == crate::components::FocusArea::Diagnostics {
+                    self.ui.close_diagnostics();
+                } else if self.ui.get_focus() == crate::components::FocusArea::Search {
+                    self.ui.close_search();
+                } else {
+                    // Otherwise treat as quit
+                    self.running = false;
+                }
+            }
+            Event::Input(character) => {
+                if self.ui.get_focus() == crate::components::FocusArea::QueryInput {
+                    self.query_input.push(character);
+                }
+            }
+            Event::Backspace => {
+                if self.ui.get_focus() == crate::components::FocusArea::QueryInput {
+                    self.query_input.pop();
+                }
+            }
+            Event::Enter => match self.ui.get_focus() {
+                crate::components::FocusArea::QueryInput => {
+                    if !self.query_input.is_empty() {
+                        self.process_query().await;
+                        self.query_input.clear();
+                    }
+                }
+                _ => {}
+            },
+            Event::Tab => {
+                // Tab switches between main tabs when focused on tabs, otherwise toggles focus
+                if self.ui.get_focus() == crate::components::FocusArea::MainTabs {
+                    self.ui.next_tab();
+                } else {
+                    self.ui.toggle_focus();
+                }
+            }
+            Event::FocusNext => {
+                self.ui.toggle_focus();
+            }
+            Event::FocusPrev => {
+                self.ui.toggle_focus();
+            }
+            Event::Up => {
+                if self.ui.get_focus() == crate::components::FocusArea::MainTabs {
+                    self.ui.handle_up(&nav_ctx);
+                }
+            }
+            Event::Down => {
+                if self.ui.get_focus() == crate::components::FocusArea::MainTabs {
+                    self.ui.handle_down(&nav_ctx);
+                }
+            }
+            Event::Left => {
+                if self.ui.get_focus() == crate::components::FocusArea::MainTabs {
+                    self.ui.handle_left();
+                }
+            }
+            Event::Right => {
+                if self.ui.get_focus() == crate::components::FocusArea::MainTabs {
+                    self.ui.handle_right();
+                }
+            }
+            Event::CycleProxy => {
+                let activity = self.cycle_proxy_selection();
+                self.activities.push(activity);
+            }
+            Event::StartProxy => {
+                let activity = self.handle_start_default_proxy().await;
+                self.activities.push(activity);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Handle quick access action
+    async fn handle_quick_action(&mut self, action: String) {
+        info!("Executing quick action: {}", action);
+
+        if let Some(mode) = action.strip_prefix("set_mode_") {
+            let activity = self.handle_routing_mode_change(mode).await;
+            self.activities.push(activity);
+            return;
+        }
+
+        // If we have an IPC client (proxy connected), route the action through it
+        if let Some(ipc_client) = self.ipc_client.clone() {
+            // Create activity immediately showing processing state
+            let activity_index = self.activities.len();
+            let processing_activity = ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "Proxy".to_string(),
+                action: format!("Executing action: {}", action),
+                status: crate::components::ActivityStatus::Processing,
+                metrics: None,
+            };
+            self.activities.push(processing_activity);
+
+            // Convert quick action to a query for the proxy
+            let query = match action.as_str() {
+                "list_tools" => "What tools are available?".to_string(),
+                "check_health" => "Check the health status of all servers".to_string(),
+                "open_session" => "Start a new interactive session".to_string(),
+                _ => action.clone(),
+            };
+
+            // Route through proxy
+            if let Err(e) = self
+                .process_query_via_ipc(ipc_client, query.clone(), activity_index)
+                .await
+            {
+                warn!("Failed to execute quick action via proxy: {}", e);
+                if let Some(activity) = self.activities.get_mut(activity_index) {
+                    activity.status = crate::components::ActivityStatus::Failed;
+                    activity.action = format!("{} (proxy routing failed)", action);
+                }
+            }
+            return;
+        }
+
+        // Fallback to direct handling when no proxy is connected
+        let activity = match action.as_str() {
+            "list_tools" => self.handle_list_tools().await,
+            "check_health" => self.handle_check_health().await,
+            "open_session" => ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: "Session opened (connect proxy for full functionality)".to_string(),
+                status: crate::components::ActivityStatus::Success,
+                metrics: None,
+            },
+            "start_default_proxy" => self.handle_start_default_proxy().await,
+            "start_gemini_client" => self.handle_start_gemini_client().await,
+            _ => ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: format!("Unknown action: {}", action),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            },
+        };
+
+        self.activities.push(activity);
+    }
+
+    /// Start a default proxy with semantic routing
+    async fn handle_start_default_proxy(&mut self) -> ActivityItem {
+        use tokio::process::Command;
+
+        info!("Starting default proxy with semantic routing");
+
+        // Check if test server exists
+        let test_server_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/common/test_server.py");
+
+        if !test_server_path.exists() {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: "Cannot start proxy: test_server.py not found".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        }
+
+        // Check if mcp-cli binary is already built
+        let binary_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release/mcp-cli");
+
+        if !binary_path.exists() {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: "Binary not found. Run: cargo build --release -p mcp-cli".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        }
+
+        // Open log file for proxy stderr
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("proxy.log")
+            .ok();
+
+        // Start proxy directly from binary (no compilation needed)
+        let mut cmd = Command::new(&binary_path);
+        cmd.args(&[
+            "proxy",
+            "--routing-mode",
+            "semantic",
+            "--transport",
+            "stdio",
+            "--command",
+            &format!("python3 {}", test_server_path.to_string_lossy()),
+        ])
+        .env("MCP_ENABLE_LITERT", "1")
+        .env(
+            "LITERT_LM_PATH",
+            std::env::var("LITERT_LM_PATH").unwrap_or_else(|_| {
+                // Default to home directory + LiteRT-LM
+                std::env::var("HOME")
+                    .map(|h| format!("{}/LiteRT-LM", h))
+                    .unwrap_or_else(|_| "/Users/rpm/LiteRT-LM".to_string())
+            }),
+        )
+        .env(
+            "DYLD_LIBRARY_PATH",
+            std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default(),
+        )
+        .stdout(std::process::Stdio::null());
+
+        // Redirect stderr to log file if available, otherwise null
+        if let Some(file) = log_file {
+            cmd.stderr(std::process::Stdio::from(file));
+        } else {
+            cmd.stderr(std::process::Stdio::null());
+        }
+
+        let result = cmd.spawn();
+
+        match result {
+            Ok(_child) => {
+                info!("Default proxy started successfully");
+                ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "System".to_string(),
+                    action: "Started default proxy with semantic routing (check Servers panel)"
+                        .to_string(),
+                    status: crate::components::ActivityStatus::Success,
+                    metrics: None,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to start default proxy: {}", e);
+                ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "System".to_string(),
+                    action: format!("Failed to start proxy: {}", e),
+                    status: crate::components::ActivityStatus::Failed,
+                    metrics: None,
+                }
+            }
+        }
+    }
+
+    /// Start Gemini MCP client in a shell
+    async fn handle_start_gemini_client(&mut self) -> ActivityItem {
+        use std::process::Command;
+
+        info!("Starting Gemini MCP client in shell");
+
+        // First, add the MCP server using `gemini mcp add`
+        let add_result = tokio::process::Command::new("gemini")
+            .args(&[
+                "mcp",
+                "add",
+                "mcp-proxy",
+                "http://127.0.0.1:8080/sse",
+                "--transport",
+                "sse",
+                "--scope",
+                "user",
+                "--description",
+                "MCP Proxy Server from TUI",
+            ])
+            .output()
+            .await;
+
+        match add_result {
+            Ok(output) if output.status.success() => {
+                info!("Successfully configured Gemini MCP server");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Ignore "already exists" or "updated" messages - that's fine
+                if !stderr.contains("already") && !stderr.is_empty() {
+                    warn!("Failed to add MCP server to Gemini: {}", stderr);
+                    return ActivityItem {
+                        timestamp: chrono::Utc::now(),
+                        client: "User".to_string(),
+                        server: "System".to_string(),
+                        action: format!("Failed to configure Gemini MCP server: {}", stderr),
+                        status: crate::components::ActivityStatus::Failed,
+                        metrics: None,
+                    };
+                } else {
+                    info!("Gemini MCP server already configured or updated");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to run 'gemini mcp add': {}", e);
+                return ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "System".to_string(),
+                    action: format!("Failed to configure Gemini (gemini CLI not found?): {}", e),
+                    status: crate::components::ActivityStatus::Failed,
+                    metrics: None,
+                };
+            }
+        }
+
+        // Now launch terminal with gemini command
+        let result = if cfg!(target_os = "macos") {
+            // macOS: Use open -a Terminal
+            Command::new("open")
+                .args(&["-a", "Terminal", "--args", "-e", "gemini"])
+                .spawn()
+        } else if cfg!(target_os = "linux") {
+            // Linux: Try common terminal emulators
+            Command::new("x-terminal-emulator")
+                .args(&["-e", "gemini"])
+                .spawn()
+                .or_else(|_| {
+                    Command::new("gnome-terminal")
+                        .args(&["--", "gemini"])
+                        .spawn()
+                })
+                .or_else(|_| Command::new("xterm").args(&["-e", "gemini"]).spawn())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unsupported platform",
+            ))
+        };
+
+        match result {
+            Ok(_) => {
+                info!("Gemini client launched in new terminal");
+                ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "System".to_string(),
+                    action: "Launched Gemini MCP client in new terminal (server configured)"
+                        .to_string(),
+                    status: crate::components::ActivityStatus::Success,
+                    metrics: None,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to launch Gemini client: {}", e);
+                ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "System".to_string(),
+                    action: format!("Failed to launch Gemini client: {}", e),
+                    status: crate::components::ActivityStatus::Failed,
+                    metrics: None,
+                }
+            }
+        }
+    }
+
+    async fn handle_routing_mode_change(&mut self, mode: &str) -> ActivityItem {
+        let normalized = mode.to_ascii_lowercase();
+        let human_label = match normalized.as_str() {
+            "bypass" => "Bypass",
+            "semantic" => "Semantic",
+            "hybrid" => "Hybrid",
+            _ => {
+                return ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: "Proxy".to_string(),
+                    action: format!(
+                        "Invalid routing mode '{}'. Valid modes: bypass, semantic, hybrid",
+                        mode
+                    ),
+                    status: crate::components::ActivityStatus::Failed,
+                    metrics: None,
+                };
+            }
+        };
+
+        let Some(ipc_client) = self.ipc_client.clone() else {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "Proxy".to_string(),
+                action: "Cannot set routing mode (IPC not connected)".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        };
+
+        // Get all proxies
+        let proxies: Vec<_> = self
+            .servers
+            .values()
+            .filter(|server| matches!(server.server_type, ServerType::Proxy))
+            .cloned()
+            .collect();
+
+        if proxies.is_empty() {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "Proxy".to_string(),
+                action: "No proxy registered with monitor".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        }
+
+        // Use selected proxy if set, otherwise use first proxy (or show error for multiple)
+        let target_proxy = if let Some(selected_id) = &self.selected_proxy_id {
+            proxies.iter().find(|p| &p.id == selected_id).cloned()
+        } else if proxies.len() == 1 {
+            // Auto-select if only one proxy
+            self.selected_proxy_id = Some(proxies[0].id.clone());
+            Some(proxies[0].clone())
+        } else {
+            // Multiple proxies, none selected
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "Proxy".to_string(),
+                action: format!(
+                    "Multiple proxies detected ({}). Use 'P' key to select target proxy first",
+                    proxies.len()
+                ),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        };
+
+        let Some(proxy_server) = target_proxy else {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "Proxy".to_string(),
+                action: "Selected proxy not found".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        };
+
+        let Ok(proxy_uuid) = Uuid::parse_str(&proxy_server.id) else {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: proxy_server.name.clone(),
+                action: "Invalid proxy identifier".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        };
+
+        let message = IpcMessage::RoutingModeChange {
+            proxy_id: ProxyId(proxy_uuid),
+            mode: normalized.clone(),
+        };
+
+        let mut client = ipc_client.lock().await;
+        match client.send(message).await {
+            Ok(_) => {
+                self.diagnostics.routing_mode = Some(human_label.to_string());
+                ActivityItem {
+                    timestamp: chrono::Utc::now(),
+                    client: "User".to_string(),
+                    server: proxy_server.name.clone(),
+                    action: format!("Routing mode set to {}", human_label),
+                    status: crate::components::ActivityStatus::Success,
+                    metrics: None,
+                }
+            }
+            Err(err) => ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: proxy_server.name.clone(),
+                action: format!("Failed to set routing mode: {}", err),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            },
+        }
+    }
+
+    /// Cycle through available proxies for routing mode control
+    fn cycle_proxy_selection(&mut self) -> ActivityItem {
+        let proxies: Vec<_> = self
+            .servers
+            .values()
+            .filter(|server| matches!(server.server_type, ServerType::Proxy))
+            .cloned()
+            .collect();
+
+        if proxies.is_empty() {
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: "No proxies available to select".to_string(),
+                status: crate::components::ActivityStatus::Failed,
+                metrics: None,
+            };
+        }
+
+        if proxies.len() == 1 {
+            self.selected_proxy_id = Some(proxies[0].id.clone());
+            return ActivityItem {
+                timestamp: chrono::Utc::now(),
+                client: "User".to_string(),
+                server: "System".to_string(),
+                action: format!("Only one proxy: {} (auto-selected)", proxies[0].name),
+                status: crate::components::ActivityStatus::Success,
+                metrics: None,
+            };
+        }
+
+        // Find current selection index
+        let current_idx = self
+            .selected_proxy_id
+            .as_ref()
+            .and_then(|id| proxies.iter().position(|p| &p.id == id));
+
+        // Cycle to next proxy
+        let next_idx = match current_idx {
+            Some(idx) => (idx + 1) % proxies.len(),
+            None => 0,
+        };
+
+        let selected_proxy = &proxies[next_idx];
+        self.selected_proxy_id = Some(selected_proxy.id.clone());
+
+        let mode_info = selected_proxy
+            .routing_mode
+            .as_ref()
+            .map(|m| format!(" (mode: {})", m))
+            .unwrap_or_default();
+
+        ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: "System".to_string(),
+            action: format!(
+                "Selected proxy {} of {}: {}{}",
+                next_idx + 1,
+                proxies.len(),
+                selected_proxy.name,
+                mode_info
+            ),
+            status: crate::components::ActivityStatus::Success,
+            metrics: None,
+        }
+    }
+
+    /// List tools from all connected servers
+    async fn handle_list_tools(&mut self) -> ActivityItem {
+        if let Some(gateway) = self.gateway_client.clone() {
+            match self.list_tools_via_gateway(gateway).await {
+                Ok(activity) => return activity,
+                Err(err) => {
+                    warn!("Gateway list_tools failed: {}", err);
+                    return self.list_tools_from_state(Some(err.to_string()));
+                }
+            }
+        }
+
+        self.list_tools_from_state(None)
+    }
+
+    /// Check health of gateway and servers
+    async fn handle_check_health(&mut self) -> ActivityItem {
+        if let Some(gateway) = self.gateway_client.clone() {
+            match self.check_health_via_gateway(gateway).await {
+                Ok(activity) => return activity,
+                Err(err) => {
+                    warn!("Gateway health check failed: {}", err);
+                    return self.check_health_from_state(Some(err.to_string()));
+                }
+            }
+        }
+
+        self.check_health_from_state(None)
+    }
+
+    fn list_tools_from_state(&self, gateway_error: Option<String>) -> ActivityItem {
+        let server_names: Vec<String> = self.servers.values().map(|s| s.name.clone()).collect();
+        let base_message = if server_names.is_empty() {
+            "No servers connected. Start proxies to see available tools.".to_string()
+        } else {
+            format!(
+                "Connected to {} server(s): {}.",
+                server_names.len(),
+                server_names.join(", ")
+            )
+        };
+
+        let action = if let Some(error) = gateway_error.as_ref() {
+            format!("Gateway unavailable ({}). {}", error, base_message)
+        } else {
+            base_message
+        };
+
+        let status = if server_names.is_empty() {
+            crate::components::ActivityStatus::Failed
+        } else if gateway_error.is_some() {
+            crate::components::ActivityStatus::Failed
+        } else {
+            crate::components::ActivityStatus::Success
+        };
+
+        ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: "Gateway".to_string(),
+            action,
+            status,
+            metrics: None,
+        }
+    }
+
+    fn check_health_from_state(&self, gateway_error: Option<String>) -> ActivityItem {
+        let healthy_servers = self
+            .servers
+            .values()
+            .filter(|s| matches!(s.status, crate::components::ServerStatus::Running))
+            .count();
+        let total_servers = self.servers.len();
+        let total_clients = self.clients.len();
+        let active_sessions = self.proxy_sessions.len();
+
+        let mut action = format!(
+            "Health: {}/{} servers running, {} clients, {} active sessions",
+            healthy_servers, total_servers, total_clients, active_sessions
+        );
+
+        if let Some(error) = gateway_error.as_ref() {
+            action = format!("Gateway health unavailable ({}). {}", error, action);
+        }
+
+        let status = if total_servers == 0 {
+            crate::components::ActivityStatus::Failed
+        } else if healthy_servers == total_servers && gateway_error.is_none() {
+            crate::components::ActivityStatus::Success
+        } else if gateway_error.is_some() {
+            crate::components::ActivityStatus::Failed
+        } else {
+            crate::components::ActivityStatus::Processing
+        };
+
+        ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: "Gateway".to_string(),
+            action,
+            status,
+            metrics: None,
+        }
+    }
+
+    async fn process_query_via_ipc(
+        &mut self,
+        ipc_client: Arc<AsyncMutex<IpcClient>>,
+        query: String,
+        activity_index: usize,
+    ) -> Result<()> {
+        info!("Routing query through proxy via IPC: {}", query);
+
+        // Generate correlation ID for this query
+        let correlation_id = uuid::Uuid::new_v4();
+
+        // Track pending query
+        self.pending_queries
+            .insert(correlation_id, (query.clone(), activity_index));
+
+        // Send query to proxy via IPC
+        let message = IpcMessage::TuiQuery {
+            query: query.clone(),
+            correlation_id,
+        };
+
+        let mut client = ipc_client.lock().await;
+        client.send(message).await?;
+
+        info!(
+            "Query sent via IPC with correlation_id: {:?}",
+            correlation_id
+        );
+
+        // Response will be handled asynchronously via AppStateUpdate::QueryResponse
+        Ok(())
+    }
+
+    async fn process_query_via_gateway(
+        &mut self,
+        gateway: GatewayConnection,
+        query: String,
+        activity_index: usize,
+    ) -> Result<()> {
+        let client_arc = gateway.client.clone();
+        let mut client = client_arc.lock().await;
+
+        if !client.is_ready().await {
+            return Err(anyhow!("gateway client not ready"));
+        }
+
+        let params = json!({
+            "name": "web_search",
+            "arguments": {
+                "input": query.clone()
+            }
+        });
+
+        let response = client
+            .send_request("tools/call", params)
+            .await
+            .context("gateway tools/call request failed")?;
+
+        if let Some(error) = response.error {
+            return Err(anyhow!(format!("{} (code {})", error.message, error.code)));
+        }
+
+        let result = response
+            .result
+            .ok_or_else(|| anyhow!("gateway response missing result payload"))?;
+
+        let text = Self::extract_text_from_result(&result)
+            .unwrap_or_else(|| "Request completed but no textual response received".to_string());
+
+        if let Some(activity) = self.activities.get_mut(activity_index) {
+            activity.server = "Gateway".to_string();
+            activity.action = format!("{}: {}", query, text.trim());
+            activity.status = crate::components::ActivityStatus::Success;
+        }
+
+        Ok(())
+    }
+
+    async fn process_query_via_llm(&mut self, query: String, activity_index: usize) -> Result<()> {
+        let llm_service = self
+            .llm_service
+            .as_ref()
+            .ok_or_else(|| anyhow!("LLM service unavailable"))?
+            .clone();
+
+        let generation_id = self.next_generation_id;
+        self.next_generation_id += 1;
+
+        // Note: LLM responses are now shown in the main activity feed
+        // No need for separate LLM response panel anymore
+
+        self.active_generations.insert(
+            generation_id,
+            ActiveGeneration {
+                prompt: query.clone(),
+                accumulated: String::new(),
+                activity_index,
+            },
+        );
+
+        let llm_config = self.config.llm_config();
+        let request = GenerationRequest {
+            prompt: query,
+            temperature: Some(llm_config.llm.temperature),
+            max_tokens: Some(llm_config.llm.max_tokens),
+        };
+
+        match llm_service.start_generation(request).await {
+            Ok(mut handle) => {
+                let tx = self.generation_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = handle.next().await {
+                        match event {
+                            GenerationEvent::Token(token) => {
+                                let _ = tx.send(UiGenerationEvent::Token {
+                                    id: generation_id,
+                                    token,
+                                });
+                            }
+                            GenerationEvent::Completed(metrics) => {
+                                let _ = tx.send(UiGenerationEvent::Completed {
+                                    id: generation_id,
+                                    metrics,
+                                });
+                            }
+                        }
+                    }
+                });
+
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(active) = self.active_generations.remove(&generation_id) {
+                    if let Some(activity) = self.activities.get_mut(active.activity_index) {
+                        activity.status = crate::components::ActivityStatus::Failed;
+                        activity.action = format!("{} (error starting generation)", active.prompt);
+                    }
+                }
+                Err(anyhow!(e))
+            }
+        }
+    }
+
+    async fn list_tools_via_gateway(&self, gateway: GatewayConnection) -> Result<ActivityItem> {
+        let client_arc = gateway.client.clone();
+        let mut client = client_arc.lock().await;
+
+        if !client.is_ready().await {
+            return Err(anyhow!("gateway client not ready"));
+        }
+
+        let response = client
+            .send_request("tools/list", json!({}))
+            .await
+            .context("gateway tools/list request failed")?;
+
+        if let Some(error) = response.error {
+            return Err(anyhow!(format!("{} (code {})", error.message, error.code)));
+        }
+
+        let result = response
+            .result
+            .ok_or_else(|| anyhow!("gateway response missing tools"))?;
+
+        let tool_names: Vec<String> = result
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("name").and_then(|v| v.as_str()))
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let action = if tool_names.is_empty() {
+            "Gateway reports no tools".to_string()
+        } else {
+            format!("Tools available: {}", tool_names.join(", "))
+        };
+
+        Ok(ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: "Gateway".to_string(),
+            action,
+            status: crate::components::ActivityStatus::Success,
+            metrics: None,
+        })
+    }
+
+    async fn check_health_via_gateway(&self, gateway: GatewayConnection) -> Result<ActivityItem> {
+        let client_arc = gateway.client.clone();
+        let mut client = client_arc.lock().await;
+
+        if !client.is_ready().await {
+            return Err(anyhow!("gateway client not ready"));
+        }
+
+        let response = client
+            .send_request("resources/list", json!({}))
+            .await
+            .context("gateway resources/list request failed")?;
+
+        if let Some(error) = response.error {
+            return Err(anyhow!(format!("{} (code {})", error.message, error.code)));
+        }
+
+        let result = response
+            .result
+            .ok_or_else(|| anyhow!("gateway response missing health data"))?;
+
+        let resource_count = result
+            .get("resources")
+            .and_then(|value| value.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
+        let healthy_servers = self
+            .servers
+            .values()
+            .filter(|s| matches!(s.status, crate::components::ServerStatus::Running))
+            .count();
+        let total_servers = self.servers.len();
+        let total_clients = self.clients.len();
+        let active_sessions = self.proxy_sessions.len();
+
+        Ok(ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: "Gateway".to_string(),
+            action: format!(
+                "Health: {}/{} servers running, {} clients, {} active sessions, {} resources",
+                healthy_servers, total_servers, total_clients, active_sessions, resource_count
+            ),
+            status: crate::components::ActivityStatus::Success,
+            metrics: None,
+        })
+    }
+
+    fn extract_text_from_result(result: &Value) -> Option<String> {
+        if let Some(content) = result.get("content").and_then(|value| value.as_array()) {
+            for item in content {
+                if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
+        if let Some(messages) = result.get("messages").and_then(|value| value.as_array()) {
+            for message in messages {
+                if let Some(content) = message.get("content") {
+                    if let Some(text) = content.get("text").and_then(|value| value.as_str()) {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+
+        result
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Spawn auto-proxy that connects TUI to the MCP server via HTTP-SSE
+    async fn spawn_auto_proxy(mcp_server_url: &str) -> Result<tokio::process::Child> {
+        use tokio::process::Command;
+
+        info!(
+            "Spawning auto-proxy with --in http-sse --out http-sse --url {}",
+            mcp_server_url
+        );
+
+        // Find mcp-cli binary
+        let binary_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/release/mcp-cli");
+
+        if !binary_path.exists() {
+            return Err(anyhow::anyhow!(
+                "mcp-cli binary not found at {}. Run: cargo build --release -p mcp-cli",
+                binary_path.display()
+            ));
+        }
+
+        // Spawn proxy: mcp-cli proxy --in http-sse --out http-sse --url <mcp-server-url>
+        let child = Command::new(&binary_path)
+            .args(&[
+                "proxy",
+                "--in",
+                "http-sse",
+                "--out",
+                "http-sse",
+                "--url",
+                mcp_server_url,
+                "--name",
+                "tui-auto-proxy",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to spawn auto-proxy process")?;
+
+        Ok(child)
+    }
+
+    async fn initialize_gateway_client() -> Result<Option<GatewayConnection>> {
+        let Some(config_path) = Self::resolve_gateway_config_path() else {
+            debug!("No MCP gateway config detected; starting without gateway client");
+            return Ok(None);
+        };
+
+        let transport_config = TransportConfig::from_file(&config_path).with_context(|| {
+            format!(
+                "Failed to load gateway config from {}",
+                config_path.display()
+            )
+        })?;
+
+        let mut client = McpClient::with_defaults(transport_config.clone())
+            .await
+            .context("Failed to construct MCP client")?;
+
+        let identity = McpImplementation::new("mcp-tui", env!("CARGO_PKG_VERSION"))
+            .with_metadata("ui", json!({ "mode": "tui" }));
+
+        match client.connect(identity.clone()).await {
+            Ok(server_info) => {
+                info!(
+                    "Connected to gateway server: {} ({})",
+                    server_info.implementation.name, server_info.protocol_version
+                );
+            }
+            Err(err) => {
+                warn!("Unable to connect to gateway server: {}", err);
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(GatewayConnection {
+            client: Arc::new(AsyncMutex::new(client)),
+        }))
+    }
+
+    fn resolve_gateway_config_path() -> Option<PathBuf> {
+        if let Ok(path) = env::var("MCP_GATEWAY_CONFIG") {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Some(path);
+            }
+            warn!(
+                "MCP_GATEWAY_CONFIG set to {} but file does not exist",
+                path.display()
+            );
+        }
+
+        let default_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../mcp-core/config.json");
+        if default_path.exists() {
+            return Some(default_path);
+        }
+
+        None
+    }
+
+    /// Process user query from input
+    async fn process_query(&mut self) {
+        let query = self.query_input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        info!("Processing query: {}", query);
+
+        // Check for routing prefix: @proxy, @gateway, or default to local LLM
+        let (target, actual_query) = if let Some(rest) = query.strip_prefix("@proxy ") {
+            ("Proxy", rest.to_string())
+        } else if let Some(rest) = query.strip_prefix("@gateway ") {
+            ("Gateway", rest.to_string())
+        } else {
+            ("LLM", query.clone())
+        };
+
+        let user_activity = ActivityItem {
+            timestamp: chrono::Utc::now(),
+            client: "User".to_string(),
+            server: target.to_string(),
+            action: actual_query.clone(),
+            status: crate::components::ActivityStatus::Processing,
+            metrics: None,
+        };
+        self.activities.push(user_activity);
+        let activity_index = self.activities.len().saturating_sub(1);
+
+        self.diagnostics.ttft = None;
+        self.diagnostics.tokens_per_sec = None;
+
+        // Route based on prefix
+        match target {
+            "Proxy" => {
+                if let Some(ipc_client) = self.ipc_client.clone() {
+                    if let Err(err) = self
+                        .process_query_via_ipc(ipc_client, actual_query.clone(), activity_index)
+                        .await
+                    {
+                        warn!("Proxy query failed: {}", err);
+                        if let Some(activity) = self.activities.get_mut(activity_index) {
+                            activity.status = crate::components::ActivityStatus::Failed;
+                            activity.action = format!("{} (proxy error: {})", actual_query, err);
+                        }
+                    }
+                } else {
+                    if let Some(activity) = self.activities.get_mut(activity_index) {
+                        activity.status = crate::components::ActivityStatus::Failed;
+                        activity.action = format!("{} (no proxy connected)", actual_query);
+                    }
+                }
+            }
+            "Gateway" => {
+                if let Some(gateway) = self.gateway_client.clone() {
+                    if let Err(err) = self
+                        .process_query_via_gateway(gateway, actual_query.clone(), activity_index)
+                        .await
+                    {
+                        warn!("Gateway query failed: {}", err);
+                        if let Some(activity) = self.activities.get_mut(activity_index) {
+                            activity.status = crate::components::ActivityStatus::Failed;
+                            activity.action = format!("{} (gateway error: {})", actual_query, err);
+                        }
+                    }
+                } else {
+                    if let Some(activity) = self.activities.get_mut(activity_index) {
+                        activity.status = crate::components::ActivityStatus::Failed;
+                        activity.action = format!("{} (no gateway connected)", actual_query);
+                    }
+                }
+            }
+            _ => {
+                // Default: local LLM
+                if let Err(err) = self
+                    .process_query_via_llm(actual_query.clone(), activity_index)
+                    .await
+                {
+                    warn!("LLM processing failed: {}", err);
+                    if let Some(activity) = self.activities.get_mut(activity_index) {
+                        activity.status = crate::components::ActivityStatus::Failed;
+                        activity.action = format!("{} (processing failed: {})", actual_query, err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update application state
+    async fn update_state(&mut self) {
+        // Refresh models when settings panel is first opened each session
+        if self.ui.should_refresh_models() {
+            self.ui
+                .settings_panel
+                .refresh_models(self.llm_service.clone())
+                .await;
+        }
+
+        // Reset models refresh flag when leaving settings
+        self.ui.reset_models_refresh_flag();
+
+        // Process IPC updates from gateway (non-blocking)
+        while let Ok(update) = self.ipc_update_receiver.try_recv() {
+            match update {
+                AppStateUpdate::ClientAdded(client) => {
+                    debug!("Adding client: {}", client.id);
+                    self.clients.insert(client.id.clone(), client);
+                }
+                AppStateUpdate::ClientRemoved(client_id) => {
+                    debug!("Removing client: {}", client_id);
+                    self.clients.remove(&client_id);
+                }
+                AppStateUpdate::ClientUpdated {
+                    client_id,
+                    requests_sent,
+                    last_activity,
+                } => {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.requests_sent = requests_sent;
+                        client.last_activity = last_activity;
+                    }
+                }
+                AppStateUpdate::ServerAdded(server) => {
+                    debug!("Adding server: {}", server.id);
+
+                    // If this is a proxy and we don't have an IPC client yet, create one
+                    if server.server_type == crate::components::ServerType::Proxy
+                        && self.ipc_client.is_none()
+                    {
+                        // Connect to the same socket the proxy is using
+                        let socket_path = std::env::var("MCP_IPC_SOCKET")
+                            .unwrap_or_else(|_| "/tmp/mcp-monitor.sock".to_string());
+                        let command_socket = format!("{}.recv", socket_path);
+
+                        match IpcClient::connect(&command_socket).await {
+                            Ok(client) => {
+                                info!(
+                                    "Created IPC client for query routing to proxy {}",
+                                    server.id
+                                );
+                                self.ipc_client = Some(Arc::new(AsyncMutex::new(client)));
+                            }
+                            Err(e) => {
+                                warn!("Failed to create IPC client: {}", e);
+                            }
+                        }
+                    }
+
+                    self.servers.insert(server.id.clone(), server);
+                }
+                AppStateUpdate::ServerRemoved(server_id) => {
+                    debug!("Removing server: {}", server_id);
+                    self.servers.remove(&server_id);
+                }
+                AppStateUpdate::ServerStatsUpdate {
+                    server_id,
+                    requests_received,
+                } => {
+                    if let Some(server) = self.servers.get_mut(&server_id) {
+                        server.requests_received = requests_received;
+                        server.last_activity = chrono::Utc::now();
+                    }
+                }
+                AppStateUpdate::ActivityAdded(activity) => {
+                    debug!(
+                        "Adding activity: {} -> {}",
+                        activity.client, activity.server
+                    );
+                    self.activities.push(activity);
+                }
+                AppStateUpdate::SessionAdded(session) => {
+                    debug!("Adding session: {}", session.id.0);
+                    self.proxy_sessions.insert(session.id.clone(), session);
+                }
+                AppStateUpdate::SessionRemoved(session_id) => {
+                    debug!("Removing session: {}", session_id.0);
+                    self.proxy_sessions.remove(&session_id);
+                }
+                AppStateUpdate::RoutingModeChanged { proxy_id, mode } => {
+                    info!("Proxy {} switched to routing mode {}", proxy_id, mode);
+                    // Update the proxy's routing mode in the servers map
+                    if let Some(server) = self.servers.get_mut(&proxy_id) {
+                        server.routing_mode = Some(mode.clone());
+                    }
+                    // Also update global diagnostics to show current mode
+                    self.diagnostics.routing_mode = Some(mode);
+                }
+                AppStateUpdate::SemanticPredictionUpdate {
+                    query,
+                    predicted_tool,
+                    confidence,
+                    actual_tool,
+                    success,
+                } => {
+                    debug!(
+                        "Semantic prediction update: {} -> {} ({:.0}%)",
+                        query,
+                        predicted_tool,
+                        confidence * 100.0
+                    );
+                    // Update the semantic prediction display
+                    self.semantic_prediction = SemanticPrediction {
+                        query: Some(query),
+                        predicted_tool: Some(predicted_tool),
+                        confidence: Some(confidence),
+                        actual_tool,
+                        success,
+                    };
+                }
+                AppStateUpdate::SessionStats(metrics) => {
+                    debug!(
+                        "Session stats received: {} predictions {:.1}% accuracy",
+                        metrics.total_predictions,
+                        metrics.accuracy * 100.0
+                    );
+                    self.diagnostics.session_accuracy = Some(metrics.accuracy as f64);
+                    self.diagnostics.session_total_predictions = Some(metrics.total_predictions);
+                    self.diagnostics.session_successful_predictions =
+                        Some(metrics.successful_predictions);
+                }
+                AppStateUpdate::QueryResponse {
+                    correlation_id,
+                    response,
+                    error,
+                    ttft_ms,
+                    tokens_per_sec,
+                    total_tokens,
+                    interceptor_delay_ms,
+                } => {
+                    debug!(
+                        "Received query response for correlation_id: {:?}",
+                        correlation_id
+                    );
+
+                    // Find and update the pending query
+                    if let Some((query, activity_index)) =
+                        self.pending_queries.remove(&correlation_id)
+                    {
+                        if let Some(activity) = self.activities.get_mut(activity_index) {
+                            if let Some(err) = error {
+                                activity.status = crate::components::ActivityStatus::Failed;
+                                activity.action = format!("{} (Error: {})", query, err);
+                            } else {
+                                activity.status = crate::components::ActivityStatus::Success;
+                                activity.action = format!("{} → {}", query, response);
+
+                                // Update diagnostics with real response and metrics
+                                self.diagnostics.last_query = Some(query.clone());
+                                self.diagnostics.last_response = Some(response.clone());
+
+                                // Use real metrics from LLM processing if available
+                                if let Some(ttft) = ttft_ms {
+                                    self.diagnostics.ttft = Some(ttft);
+                                }
+                                if let Some(tps) = tokens_per_sec {
+                                    self.diagnostics.tokens_per_sec = Some(tps);
+                                }
+                                // Store total tokens if provided
+                                if let Some(tokens) = total_tokens {
+                                    debug!("Query processed {} tokens", tokens);
+                                }
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "Received response for unknown correlation_id: {:?}",
+                            correlation_id
+                        );
+                    }
+                }
+                AppStateUpdate::ServerUpdated {
+                    server_id,
+                    name,
+                    status,
+                } => {
+                    if let Some(server) = self.servers.get_mut(&server_id) {
+                        server.name = name;
+                        server.status = status;
+                        server.last_activity = chrono::Utc::now();
+                    }
+                }
+                AppStateUpdate::ServerHealthUpdate { server_id, metrics } => {
+                    debug!(
+                        "Server {} health: CPU {:.1}% Memory {} MB",
+                        server_id,
+                        metrics.cpu_percent,
+                        metrics.memory_bytes / (1024 * 1024)
+                    );
+                    // Store health metrics if needed (could add to Server struct)
+                    if let Some(_server) = self.servers.get_mut(&server_id) {
+                        // TODO: Add health_metrics field to Server struct if needed
+                    }
+                }
+                AppStateUpdate::SessionUpdated(session) => {
+                    debug!("Session updated: {}", session.id.0);
+                    self.proxy_sessions.insert(session.id.clone(), session);
+                }
+                AppStateUpdate::InterceptorStats { proxy_id, stats } => {
+                    debug!(
+                        "Interceptor stats for proxy {}: {} total messages, {} modifications",
+                        proxy_id, stats.total_messages_processed, stats.total_modifications_made
+                    );
+                    // Store interceptor stats in diagnostics
+                    self.diagnostics.interceptor_count = Some(stats.interceptors.len() as u64);
+                    self.diagnostics.interceptor_modifications =
+                        Some(stats.total_modifications_made);
+                    self.diagnostics.interceptor_blocks = Some(stats.total_messages_blocked);
+                }
+                AppStateUpdate::GatewayStateUpdate {
+                    active_proxies,
+                    total_clients,
+                    total_servers,
+                    uptime_seconds,
+                } => {
+                    debug!(
+                        "Gateway state: {} proxies, {} clients, {} servers, uptime {}s",
+                        active_proxies, total_clients, total_servers, uptime_seconds
+                    );
+                    // Update gateway state in diagnostics
+                    self.diagnostics.gateway_active_proxies = Some(active_proxies as u64);
+                    self.diagnostics.gateway_total_clients = Some(total_clients as u64);
+                    self.diagnostics.gateway_total_servers = Some(total_servers as u64);
+                    self.diagnostics.gateway_uptime_seconds = Some(uptime_seconds);
+                }
+                AppStateUpdate::GatewayMetrics {
+                    total_requests,
+                    total_errors,
+                    avg_response_time_ms,
+                    requests_per_second,
+                } => {
+                    debug!(
+                        "Gateway metrics: {} requests, {} errors, {:.2}ms avg, {:.1} rps",
+                        total_requests, total_errors, avg_response_time_ms, requests_per_second
+                    );
+                    // Update gateway metrics in diagnostics
+                    self.diagnostics.gateway_total_requests = Some(total_requests);
+                    self.diagnostics.gateway_total_errors = Some(total_errors);
+                    self.diagnostics.gateway_avg_response_time = Some(avg_response_time_ms);
+                    self.diagnostics.gateway_requests_per_sec = Some(requests_per_second);
+                }
+                AppStateUpdate::PingReceived => {
+                    debug!("Ping received from proxy");
+                    // Could track ping/pong health check status
+                }
+                AppStateUpdate::PongReceived => {
+                    debug!("Pong received from proxy");
+                    // Could track ping/pong health check status
+                }
+            }
+        }
+
+        // Apply streamed generation updates (non-blocking)
+        while let Ok(event) = self.generation_rx.try_recv() {
+            match event {
+                UiGenerationEvent::Token { id, token } => {
+                    if let Some(active) = self.active_generations.get_mut(&id) {
+                        active.accumulated.push_str(&token);
+                        // Update activity feed
+                        if let Some(activity) = self.activities.get_mut(active.activity_index) {
+                            activity.action = format!("{}: {}", active.prompt, active.accumulated);
+                        }
+                        // LLM responses are now shown in the main activity feed
+                        // No separate panel needed
+                    }
+                }
+                UiGenerationEvent::Completed { id, metrics } => {
+                    if let Some(active) = self.active_generations.remove(&id) {
+                        if let Some(activity) = self.activities.get_mut(active.activity_index) {
+                            activity.action = format!("{}: {}", active.prompt, active.accumulated);
+                            activity.status = crate::components::ActivityStatus::Success;
+                        }
+
+                        // LLM responses are now shown in the main activity feed
+                        // No separate panel needed
+
+                        self.diagnostics.ttft =
+                            metrics.time_to_first_token.map(|d| d.as_secs_f64());
+                        self.diagnostics.tokens_per_sec = metrics.tokens_per_second;
+                    }
+                }
+            }
+        }
+
+        // Ingest service-wide events
+        if let Some(ref mut receiver) = self.llm_event_receiver {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    LlmEvent::ModelStatus(status) => {
+                        debug!("Model status changed: {:?}", status);
+                        self.diagnostics.model_status = status;
+                    }
+                    LlmEvent::DownloadProgress(progress) => {
+                        debug!("Download progress: {}%", progress.percentage);
+                        self.diagnostics.download_progress = Some(progress);
+                    }
+                    LlmEvent::ModelReady { name, .. } => {
+                        info!("Model ready: {}", name);
+                        self.diagnostics.model_name = Some(name);
+                        self.diagnostics.model_status = acdp_llm::ModelStatus::Ready;
+                        self.diagnostics.download_progress = None;
+                    }
+                    LlmEvent::GenerationFinished { metrics, .. } => {
+                        self.diagnostics.ttft =
+                            metrics.time_to_first_token.map(|d| d.as_secs_f64());
+                        self.diagnostics.tokens_per_sec = metrics.tokens_per_second;
+                    }
+                }
+            }
+        }
+
+        if let Some(ref llm_service) = self.llm_service {
+            self.diagnostics.model_status = llm_service.model_status().await;
+            self.diagnostics.download_progress = llm_service.download_progress().await;
+
+            // Query real prediction accuracy from database (last 24 hours)
+            let predictions_db = llm_service.predictions_database();
+            if let Ok(metrics) = predictions_db.get_accuracy_metrics(24).await {
+                self.diagnostics.dspy_accuracy = Some(metrics.accuracy);
+            } else {
+                self.diagnostics.dspy_accuracy = None;
+            }
+
+            // Query GEPA optimization metrics from database
+            let gepa_db = llm_service.gepa_database();
+            if let Ok(Some(improvement)) = gepa_db.get_average_improvement().await {
+                self.diagnostics.gepa_optimization = Some(improvement);
+            } else {
+                self.diagnostics.gepa_optimization = None;
+            }
+        } else {
+            self.diagnostics.dspy_accuracy = None;
+            self.diagnostics.gepa_optimization = None;
+        }
+
+        // Update quick actions based on proxy availability
+        // Clean up old activities to prevent memory issues
+        if self.activities.len() > 100 {
+            self.activities.drain(0..50);
+        }
+    }
+}

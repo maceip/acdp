@@ -1,0 +1,58 @@
+[package]
+name = "acdp-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Next-generation TUI for MCP gateway with intuitive interface"
+authors = ["MCP Team"]
+license = "MIT"
+
+[dependencies]
+ratatui = "0.24"
+crossterm = "0.27"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.4", features = ["v4", "serde"] }
+libc = "0.2"
+colorgrad = "0.7"
+
+# Local dependencies
+acdp-common = { path = "../acdp-common" }
+acdp-core = { path = "../acdp-core" }
+acdp-transport = { path = "../acdp-transport" }
+acdp-llm = { path = "../acdp-llm", optional = true }
+tui-gradient-block = "0.1.3"
+tui-rule = "0.1.2"
+
+# HTTP server for HTTP+SSE support
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures-util = "0.3"
+async-stream = "0.3"
+tokio-stream = { workspace = true }
+clap = { workspace = true }
+
+# TLS and ACME support
+rustls = "0.21"
+rustls-pemfile = "1.0"
+rustls-acme = { version = "0.10", features = ["axum"] }
+axum-server = { version = "0.6", features = ["rustls"] }
+tokio-rustls = "0.24"
+
+[features]
+default = ["full"]
+full = ["llm-integration"]
+llm-integration = ["acdp-llm", "llm"]
+# Feature alias for code that uses #[cfg(feature = "llm")]
+# This ensures #[cfg(feature = "llm")] works when llm-integration is enabled
+llm = []
+
+[[bin]]
+name = "acdp-tui"
+path = "src/main.rs"

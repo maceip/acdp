@@ -1,0 +1,58 @@
+[package]
+name = "acdp-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core MCP (Model Context Protocol) types, traits, and transport implementations"
+
+[lib]
+name = "acdp_core"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+# Core async and serialization
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+
+# HTTP and networking for transports
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+url = { workspace = true }
+bytes = { workspace = true }
+
+# Error handling and logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# JSON Schema validation (disabled for now - using simplified validation)
+# jsonschema = "0.18"
+
+# Async trait support
+async-trait = { workspace = true }
+
+# Configuration serialization
+toml = { workspace = true }
+humantime-serde = { workspace = true }
+
+# Utilities for protocol implementation
+pin-project-lite = "0.2"
+regex = "1.10"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+tempfile = "3.8"
+tracing-test = "0.2"
+
+[features]
+default = ["stdio", "http-sse", "http-stream"]
+stdio = []
+http-sse = []
+http-stream = [] 

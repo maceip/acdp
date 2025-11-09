@@ -1,0 +1,62 @@
+[package]
+name = "acdp-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "acdp-server"
+path = "src/main.rs"
+
+[dependencies]
+acdp-common = { workspace = true }
+mcp-auth = { workspace = true }
+
+# Web framework
+actix-web = { workspace = true }
+actix-web-lab = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP client (for Rauthy)
+reqwest = { workspace = true }
+
+# JWT
+jsonwebtoken = { workspace = true }
+ed25519-compact = { workspace = true }
+
+# Validation
+validator = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Config
+toml = { workspace = true }
+dotenvy = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# UUID
+uuid = { workspace = true }
+
+# Hex encoding
+hex = { workspace = true }
+
+# P256 (for ARC)
+p256 = { workspace = true }

@@ -1,0 +1,51 @@
+[package]
+name = "acdp-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# WASM runtime
+wasmtime = { version = "27.0", optional = true }
+wasmtime-wasi = { version = "27.0", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# V8 runtime (via deno_core)
+deno_core = { version = "0.330", optional = true }
+deno_error = { version = "0.5", optional = true }
+reqwest = { version = "0.12", optional = true, features = ["json"] }
+
+# Logging
+tracing = "0.1"
+
+# UUID for execution IDs
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Workspace deps
+acdp-common = { path = "../acdp-common" }
+acdp-llm = { path = "../acdp-llm" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = "0.3"
+wat = "1.219"  # For compiling WAT to WASM in examples
+base64 = "0.22"  # For encoding WASM binaries in examples
+
+[features]
+default = ["process"]
+process = []
+wasm = ["wasmtime", "wasmtime-wasi", "base64"]
+v8 = ["deno_core", "deno_error", "reqwest"]
+v8-worker = ["v8"]  # Hono-style worker with fetch API
+all = ["process", "wasm", "v8", "v8-worker"]

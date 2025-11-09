@@ -1,0 +1,30 @@
+[package]
+name = "acdp-cli"
+version = "0.2.0"
+edition = "2021"
+description = "CLI for Assist MCP - Intelligent MCP proxy with monitoring"
+license = "MIT"
+readme = "../README.md"
+keywords = ["mcp", "debug", "monitor", "tui", "proxy"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+acdp-common = { path = "../acdp-common" }
+acdp-tui = { path = "../acdp-tui" }
+acdp-transport = { path = "../acdp-transport" }
+acdp-llm = { path = "../acdp-llm", optional = true }
+
+[features]
+default = ["llm"]
+llm = ["acdp-transport/llm", "acdp-llm"]

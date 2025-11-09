@@ -1,0 +1,106 @@
+[package]
+name = "acdp-auth"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kontext Team <team@kontext.dev>"]
+license = "Apache-2.0"
+description = "Agent Credential Delegation Protocol (ACDP) implementation for MCP"
+repository = "https://github.com/kontext-dev/acdp-auth"
+keywords = ["mcp", "auth", "acdp", "agent", "delegation"]
+categories = ["authentication", "cryptography", "web-programming"]
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Web framework (matching Rauthy's stack)
+actix-web = { version = "4", features = ["rustls-0_23"] }
+actix = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+
+# Cryptography for ACDP
+ed25519-compact = { version = "2.0.4", features = ["ed25519"] }
+ring = "0.17"
+rand = "0.8"
+rand_core = "0.6"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+
+# ARC (Anonymous Rate-Limited Credentials) support
+p256 = { version = "0.13", features = ["hash2curve", "arithmetic", "ecdh"] }
+sha2 = "0.10"
+hkdf = "0.12"
+subtle = "2.6"
+digest = "0.10"
+
+# Sigma-proofs for ZK proofs
+sigma-proofs = { path = "../../sigma-proofs" }
+ff = { version = "0.13", features = ["derive"] }
+group = "0.13"
+
+# JWT for credentials
+jsonwebtoken = "9"
+base64 = "0.22"
+
+# Time handling
+chrono = { version = "0.4", features = ["clock", "serde", "std"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+
+# Database - Removed hiqlite due to libsqlite3-sys conflict with acdp-llm
+# Will use alternative database solution (Redis, PostgreSQL, or in-memory)
+# hiqlite = { version = "0.10.1", features = ["cache", "counters", "listen_notify_local", "webpki-roots"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Validation
+validator = { version = "0.20", features = ["derive"] }
+
+# HTTP client for token exchange
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Configuration
+toml = "0.9"
+
+# Utilities
+bytes = "1.10"
+hex = { version = "0.4", features = ["serde"] }
+arrayref = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1"
+
+[features]
+default = ["identity-bound", "anonymous", "delegation"]
+
+# ACDP credential types
+identity-bound = []
+anonymous = []  # ARC-based anonymous credentials
+hybrid = ["identity-bound", "anonymous"]
+
+# Features
+delegation = []  # Agent-to-agent delegation
+mcp-integration = []  # MCP Enterprise-Managed Authorization
+arc-proofs = []  # Zero-knowledge proofs for anonymous credentials
+
+[lib]
+name = "acdp_auth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "acdp-gateway"
+path = "src/bin/gateway.rs"
+required-features = ["identity-bound"]

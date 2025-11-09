@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "acdp-core",
+    "acdp-common",
+    "acdp-transport",
+    "acdp-tui",
+    "acdp-cli",
+    "acdp-llm",
+    "acdp-auth",
+    "acdp-sandbox",
+    "tests",
+]
+
+default-members = ["acdp-cli"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+authors = ["Kontext Team <team@kontext.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/kontext-dev/acdp"
+homepage = "https://kontext.dev"
+keywords = ["acdp", "mcp", "agent", "auth", "delegation"]
+categories = ["authentication", "cryptography", "web-programming"]
+
+[workspace.dependencies]
+# Core async and runtime
+tokio = { version = "1.37", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+fern = "0.6"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
+bytes = "1.5"
+url = "2.5"
+
+# HTTP and networking
+reqwest = { version = "0.12", features = ["json", "stream"] }
+eventsource-stream = "0.2"
+
+# TUI
+ratatui = "0.24"
+crossterm = "0.27"
+
+# Config
+toml = "0.8"
+humantime-serde = "1.1"
+
+# Utilities
+pin-project-lite = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
