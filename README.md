@@ -1,8 +1,10 @@
 ## Overview
 
-The race for reliable, autonomous agents will be won by a new "core-llm" paradigm of automatic optimization, built on fair, verifiable primitives, not last-gen trust models. Our vision is a technical stack and governance model for continuous one-shot optimization, secured by an open trust fabric: the Agent Credential Delegation Protocol (ACDP). At its core, ACDP enables the self-issuance of verifiable, cryptographic capabilities, allowing humans and agents to autonomously delegate power. This solves trust and control with privacy-preserving, unlinkable anonymous credentials and is built to interoperate with existing and emergent protocols like OAuth2, X402, ACP, and WebAuthn.
+<img  align="left" width="170" height="170" alt="Zim_V2p" src="https://github.com/user-attachments/assets/e029a276-af9c-435d-b9f0-8dede55f8f7b" />    The race for reliable, autonomous agents will be won by a new "core-llm" paradigm of automatic optimization, built on fair, verifiable primitives, not last-gen trust models. Our vision is a technical stack and governance model for continuous one-shot optimization, secured by an open trust fabric: the Agent Credential Delegation Protocol (ACDP). At its core, ACDP enables the self-issuance of verifiable, cryptographic capabilities, allowing humans and agents to autonomously delegate power. This solves trust and control with privacy-preserving, unlinkable anonymous credentials and is built to interoperate with existing and emergent protocols like OAuth2, X402, ACP, and WebAuthn.<br />
 
+---
 ### Crates
+
 
 **[acdp-core](./acdp-core)** <br />
 <dl>
