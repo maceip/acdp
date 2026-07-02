@@ -1,205 +1,411 @@
-# ACDP Security Audit Report — SQL Injection & Command Injection
+# ACDP Security Audit Report
 
-**Auditor:** Automated Security Scanner  
 **Date:** 2026-07-02  
-**Scope:** SQL injection, command injection, and code execution vulnerabilities  
-**Excludes:** Path traversal (sandbox service.rs), SSRF (V8 worker.rs), LLM auto-grant Trusted capability, prompt injection (DSPy predictor) — already known
+**Scope:** Authentication/authorization bypass and cryptographic weaknesses  
+**Repository:** ACDP — MCP Proxy and Credential Gateway  
 
 ---
 
-## Executive Summary
+## Finding 1: No CORS Configuration on Any HTTP Server
 
-The codebase demonstrates generally good SQL hygiene across both the PostgreSQL gateway (`sqlx::query!` compile-time macro) and the SQLite LLM service (`sqlx::query` / `sqlx::query_as` with `.bind()` parameters). **No SQL injection vulnerabilities were found.**
+**Severity:** HIGH  
+**Category:** CORS Misconfiguration  
 
-However, **three validated command injection / arbitrary code execution findings** were identified, all in production (non-test) code paths where attacker-influenced input can reach OS shell invocation.
+All four HTTP server implementations have **zero CORS configuration** — no CORS middleware, no `Access-Control-Allow-Origin` headers, no preflight handling. While the absence of CORS headers means browsers will *block* cross-origin JS from reading responses (the default same-origin policy), it also means:
 
-| # | Severity | Category | Location |
-|---|----------|----------|----------|
-| 1 | **CRITICAL** | Command Injection via Shell | `acdp-sandbox/src/runtime/process.rs:50-52` |
-| 2 | **HIGH** | Command Injection via Shell | `acdp-transport/src/backend_connection.rs:59-62` |
-| 3 | **HIGH** | Command Injection via Shell | `acdp-transport/src/proxy.rs:608-616` |
+- **No legitimate cross-origin clients can use the APIs** from a browser, making the gateway unusable for web-based MCP clients.
+- **Simple requests** (e.g., POST with `Content-Type: application/json` may be treated as simple by some browsers) are still *sent* — the response is just blocked from JS. State-changing operations still execute.
+- When CORS is eventually added, if done carelessly (wildcard `*`), all current endpoints will be wide-open.
+
+### Affected files:
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `acdp-gateway/acdp-server/src/main.rs` | 123-135 | Actix-web app — no `actix-cors` middleware |
+| `acdp-tui/src/http_server.rs` | 50-59 | Axum router — no `CorsLayer` |
+| `acdp-transport/src/http_sse_server.rs` | 61-67 | Axum router — no `CorsLayer` |
+| `acdp-transport/src/http_stream_server.rs` | 45-49 | Axum router — no `CorsLayer` |
+
+**Note:** `tower-http` with the `cors` feature is listed in `acdp-tui/Cargo.toml` (line 35) but is **never imported or used** in any Rust source file.
+
+**Recommendation:** Add explicit CORS middleware with an allowlist of trusted origins. Never use `*` for state-changing endpoints.
 
 ---
 
-## Finding 1 — CRITICAL: Arbitrary OS Command Execution in ProcessRuntime
+## Finding 2: No CSRF Protection on State-Changing Endpoints
 
-**File:** `acdp-sandbox/src/runtime/process.rs`, lines 50-52  
-**Category:** Command Injection (CWE-78)  
-**Severity:** CRITICAL
+**Severity:** HIGH  
+**Category:** CSRF  
 
-### Vulnerable Code
+All POST endpoints (`/credentials/issue`, `/credentials/verify`, `/credentials/delegate`, `/mcp`, `/sse`) accept requests without any CSRF protection:
+
+- No CSRF tokens
+- No `SameSite` cookie attributes (no cookies used at all — bearer tokens only)
+- No `Origin` or `Referer` header validation on the server side
+- No custom header requirements that would prevent simple cross-origin requests
+
+The `validate_origin()` method in `acdp-core/src/transport/http_sse.rs` (line 244) is a **no-op** — it logs a debug message but never actually validates anything:
 
 ```rust
-let mut child = match Command::new(&shell)
-    .arg("-c")
-    .arg(&request.code)   // <-- attacker-controlled code string
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .stdin(std::process::Stdio::null())
-    .spawn()
+fn validate_origin(&self, _request_builder: &reqwest::RequestBuilder) -> McpResult<()> {
+    if !self.security_config.validate_origin {
+        return Ok(());
+    }
+    // Only logs, never rejects
+    tracing::debug!("Origin validation enabled for localhost connection");
+    Ok(())
+}
 ```
 
-### Attack Path
-
-1. **Entry point:** `ExecutionRequest.code` field (defined in `acdp-sandbox/src/types.rs:10` as `pub code: String`) carries the code to execute.
-2. **Flow:** `SandboxService::execute()` → `ProcessRuntime::execute()` → `Command::new(shell).arg("-c").arg(&request.code)`
-3. **Multiple ingestion paths:**
-   - Direct via `SandboxService::execute(request)` (e.g., from MCP tool invocations)
-   - Via `SandboxService::execute_plan()` → `interpret_plan()` which handles `PlanNodeKind::RunPython { code, .. }` (line 224 of `service.rs`) — the `code` field is extracted from an `ExecutionPlan` graph node and passed directly to `ExecutionRequest::new(code.clone())`
-   - Via `SandboxService::plan_and_execute()` which calls the LLM-backed `LlmCodeGenerator` to produce code (from `acdp-sandbox/src/gencode.rs:81-84`) and immediately executes it
-
-4. **Impact:** Full OS command execution with the privileges of the sandbox process. The `shell` defaults to `$SHELL` or `/bin/sh`. The `request.code` is passed as a single `-c` argument to the shell, so any shell metacharacters (`; && || | $(...)` etc.) are interpreted.
-
-### Why This Is Critical
-
-The `ProcessRuntime` is one of three available runtimes (`process`, `wasm`, `v8`). When selected (either explicitly or via runtime auto-selection in `acdp-sandbox/src/selector.rs`), user-supplied or LLM-generated code is passed directly to `/bin/sh -c`. While the `WasmRuntime` provides proper sandboxing, the `ProcessRuntime` provides **no sandboxing whatsoever** — there is no seccomp, no namespace isolation, no chroot, and no input sanitization.
-
-The `LlmCodeGenerator` (`gencode.rs:59-132`) is particularly dangerous: it takes user-supplied `CodeGenerationSpec.description` and `context`, sends them to an LLM, extracts raw code from the response, and creates an `ExecutionPlan` with `CapabilityOrigin::Trusted` auto-granted capability (line 102). This means LLM-generated code bypasses capability checks entirely.
-
-### Recommendation
-
-- Default to WasmRuntime; require explicit opt-in for ProcessRuntime with security warnings
-- If ProcessRuntime must exist, apply OS-level sandboxing (seccomp-bpf, namespaces, cgroups)
-- Never auto-grant `CapabilityOrigin::Trusted` for LLM-generated code
-- Validate execution plan nodes against an allowlist before execution
+**Recommendation:** Implement `Origin` header validation on server-side endpoints. Require a custom header (e.g., `X-Requested-With`) for state-changing requests, which forces CORS preflight.
 
 ---
 
-## Finding 2 — HIGH: Shell Command Injection in ProcessBackendConnection
+## Finding 3: Weak RNG Usage in Transport Name Generation
 
-**File:** `acdp-transport/src/backend_connection.rs`, lines 59-66  
-**Category:** Command Injection (CWE-78)  
-**Severity:** HIGH
+**Severity:** LOW  
+**Category:** Weak Random Number Generation  
 
-### Vulnerable Code
+`acdp-transport/src/main.rs` lines 7-8, 49-54:
 
 ```rust
-pub async fn spawn(command: &str) -> Result<Self> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)       // <-- passes command string directly to shell
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
+
+let random_suffix: String = thread_rng()
+    .sample_iter(&Alphanumeric)
+    .take(6)
+    .map(char::from)
+    .collect();
 ```
 
-### Attack Path
+`thread_rng()` delegates to `OsRng` on modern `rand` versions, so this is actually cryptographically secure. However, generating only 6 alphanumeric characters (≈36 bits of entropy) for a proxy name could lead to collisions if many proxies are spawned.
 
-1. **Entry point:** The `command` parameter comes from `backend_command` configuration.
-2. **Flow:** `create_backend_connection(backend_url=None, backend_command=Some(cmd), ...)` → `ProcessBackendConnection::spawn(cmd)` → `Command::new("sh").arg("-c").arg(command)`
-3. **Configuration sources (traced from `acdp-tui/src/config.rs:70-71`):**
-   - Environment variable `MCP_BACKEND_COMMAND`
-   - Config file field `mcp_server.backend_command`
-4. **Invocation path:** When a new MCP client connects to the TUI server (`acdp-tui/src/acdp_server.rs:345-348`), the `backend_command` is read from `AppStateInner` and passed to `ClientProxy::new()` → `create_backend_connection()` → `ProcessBackendConnection::spawn()`
+All **cryptographic** random generation in `acdp-auth` correctly uses `rand_core::OsRng` (CSPRNG), including `ServerPrivateKey::random()`, `ClientSecrets::random()`, and all scalar generation within ARC operations.
 
-### Impact
-
-The command string is passed directly to `sh -c` without any sanitization. If the `MCP_BACKEND_COMMAND` environment variable or config file is writable by an attacker, or if a malicious config is loaded, arbitrary commands execute with the server's privileges.
-
-**Mitigating factor:** The command originates from server-side configuration (environment variable or config file), not directly from network input. However, if configuration is populated from a shared or user-writable source, this becomes exploitable.
-
-### Recommendation
-
-- Parse the command using `shell-words` or similar to extract argv, then use `Command::new(argv[0]).args(&argv[1..])` instead of `sh -c`
-- Validate the backend command against an allowlist of permitted executables
-- Log all backend command invocations for audit
+**Status:** ACCEPTABLE — no cryptographic weakness, only cosmetic proxy name collisions possible.
 
 ---
 
-## Finding 3 — HIGH: Shell Command Injection in MCP Proxy Server Startup
+## Finding 4: ARC Server Private Key Generated at Startup, Never Persisted
 
-**File:** `acdp-transport/src/proxy.rs`, lines 608-616  
-**Category:** Command Injection (CWE-78)  
-**Severity:** HIGH
+**Severity:** HIGH  
+**Category:** Key Management  
 
-### Vulnerable Code
+`acdp-gateway/acdp-server/src/services/credential.rs` lines 40-45:
 
 ```rust
-let child = if *use_shell {
-    // Use shell to execute the command
-    Command::new("sh")
-        .arg("-c")
-        .arg(command)       // <-- command from transport config
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?
-} else {
-    // Parse command and arguments
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    // ... Command::new(parts[0]).args(&parts[1..])
+let arc_server_key = Arc::new(ServerPrivateKey::random());
+let arc_server_pubkey = Arc::new(ServerPublicKey::from_private_key(
+    &arc_server_key,
+    &arc_generators,
+));
 ```
 
-### Attack Path
+The ARC server private key is generated **randomly on every application startup** and is never persisted to disk or database. This means:
 
-1. **Entry point:** `OutboundTransport::Stdio { command, use_shell }` in the transport configuration.
-2. **Flow:** `MCPProxy::start()` → `start_mcp_server()` → `Command::new("sh").arg("-c").arg(command)`
-3. **Configuration sources:**
-   - CLI argument `--command` in `acdp-transport/src/main.rs:16-17`
-   - Programmatic construction in `acdp-tui/src/app.rs:690` where it uses `format!("python3 {}", test_server_path.to_string_lossy())`
-   - `TransportConfig::from_cli_args()` in `transport_config.rs:62-96`
+1. **All ARC credentials become unverifiable after a server restart** — the verification key changes.
+2. An attacker can force credential invalidation by causing a server restart (DoS vector).
+3. There is no way to perform key rotation or backup.
 
-### Impact
+Similarly, in `acdp-auth/src/gateway.rs` line 122, the gateway keypair is generated fresh on each start:
 
-When `use_shell` is true (the default — see `acdp-transport/src/main.rs:31`), the entire command string is passed to `sh -c`. The `--command` flag is a single string argument that will be shell-interpreted.
+```rust
+let keypair = KeyPair::generate();
+```
 
-The non-shell path (lines 619-627) uses a naive `split_whitespace()` parser, which does not handle quoting, escaping, or other shell constructs — this can lead to argument injection if the command string contains spaces in paths.
+The `acdp-gateway/acdp-server` binary properly loads keys from environment variables (`ACDP_GATEWAY_SIGNING_KEY`, `ACDP_GATEWAY_PUBLIC_KEY`) for Ed25519, but the ARC keys have no such mechanism.
 
-**Mitigating factor:** The command comes from CLI arguments at startup, not from runtime network input. However, if the proxy is spawned programmatically with user-derived command strings (as in the TUI at line 690), the risk increases.
-
-### Recommendation
-
-- Use `shell-words::split()` for proper POSIX-style argument parsing instead of `split_whitespace()`
-- Consider removing `use_shell: true` as the default
-- Validate the command executable against an allowlist before spawning
+**Recommendation:** Persist ARC server keys to secure storage. Load them on startup like the Ed25519 signing keys.
 
 ---
 
-## SQL Injection Analysis — NO FINDINGS
+## Finding 5: Timing Side-Channel in Credential/Principal Comparisons
 
-### acdp-gateway (PostgreSQL via sqlx)
+**Severity:** MEDIUM  
+**Category:** Timing Side-Channel  
 
-All SQL queries in the gateway use the **`sqlx::query!` compile-time macro** with numbered bind parameters (`$1`, `$2`, etc.):
+Despite the `subtle` crate being listed as a dependency in `acdp-auth/Cargo.toml` (line 37), it is **never used** in any source file. All cryptographic comparisons use standard `==` or `!=` operators, which are not constant-time:
 
-- `acdp-gateway/acdp-server/src/services/credential.rs:333-354` — INSERT with `$1`-`$11`
-- `acdp-gateway/acdp-server/src/routes/credential_verify.rs:37-46` — SELECT with `$1`
-- `acdp-gateway/acdp-server/src/routes/credential_verify.rs:75-84` — UPDATE with `$1`
+### 5a. Principal verification — `acdp-auth/src/principal.rs` lines 72-91:
 
-The `sqlx::query!` macro validates queries against the database schema at compile time, making SQL injection impossible in these paths.
+```rust
+if self.human_id != sub { ... }
+if self.idp_issuer != iss { ... }
+if self.idp_client_id != client_id { ... }
+```
 
-### acdp-llm (SQLite via sqlx)
+Early-return on mismatch leaks which field failed via timing.
 
-All SQL queries in the LLM module use **`sqlx::query` / `sqlx::query_as` with `.bind()` parameterization**:
+### 5b. Token type check — `acdp-auth/src/mcp.rs` line 108:
 
-- `acdp-llm/src/database/routing_rules.rs` — 5 queries, all use `?` placeholders with `.bind()`
-- `acdp-llm/src/database/predictions.rs` — 6 queries, all use `?` placeholders with `.bind()`
-- `acdp-llm/src/database/metrics.rs` — 4 queries, all use `?` placeholders with `.bind()`
-- `acdp-llm/src/database/gepa.rs` — 5 queries, all use `?` placeholders with `.bind()`
+```rust
+if self.token_type != "oauth-id-jag+jwt" { ... }
+```
 
-**No `format!()`, string concatenation, or string interpolation was found in any SQL query string.** The `format!("sqlite://{}", ...)` in `acdp-llm/src/service.rs:52` constructs a connection URL from a config-derived file path, not a query — this is not SQL injection.
+### 5c. ARC presentation tag comparison — `acdp-auth/src/arc.rs` line 631:
 
-### Raw/Unchecked Query Patterns
+```rust
+if self.t != expected_t || self.m1_tag != expected_m1_tag {
+    return Ok(false);
+}
+```
 
-A search for `query_unchecked`, `raw_sql`, `execute_raw`, and `raw_query` found **zero matches** across the entire codebase.
+This compares elliptic curve points using the standard `PartialEq` trait, which is not guaranteed to be constant-time. While P-256 point comparisons are typically done on field elements (which *may* be constant-time in the `p256` crate internally), this is not documented or guaranteed.
 
----
-
-## Additional Observations
-
-### V8 Worker `op_fetch` — SSRF (Already Known, Not Reported)
-`acdp-sandbox/src/runtime/v8/worker.rs:12-30` — The `op_fetch` Deno operation allows JavaScript code running in V8 to fetch arbitrary URLs via `reqwest::get(&url)` with no URL validation or allowlist.
-
-### LLM Code Generator Auto-Grants Trusted Capability (Already Known, Not Reported)
-`acdp-sandbox/src/gencode.rs:99-104` — `CapabilityOrigin::Trusted` is auto-granted for LLM-generated plans, bypassing the capability-based security model.
+**Recommendation:** Use `subtle::ConstantTimeEq` for all security-critical comparisons, especially the ARC tag verification.
 
 ---
 
-## Summary of Recommendations
+## Finding 6: Credential Verify Endpoint Has No Authentication
 
-1. **Sandbox the ProcessRuntime** — Apply OS-level isolation (namespaces, seccomp) or deprecate in favor of WasmRuntime
-2. **Eliminate `sh -c` patterns** — Use proper argument parsing (`shell-words` crate) instead of passing command strings to a shell
-3. **Default `use_shell` to false** — The current default of `true` is dangerous
-4. **Validate command executables** — Allowlist permitted binaries for backend commands
-5. **Audit configuration sources** — Ensure `MCP_BACKEND_COMMAND` and config files cannot be influenced by untrusted users
-6. **Remove `CapabilityOrigin::Trusted` auto-grant** — Require explicit user approval for LLM-generated code execution capabilities
+**Severity:** HIGH  
+**Category:** Missing Authentication  
+
+`acdp-gateway/acdp-server/src/routes/credential_verify.rs` — The `verify_credential` endpoint requires **no authentication whatsoever**:
+
+```rust
+#[post("/credentials/verify")]
+pub async fn verify_credential(
+    state: web::Data<AppState>,
+    body: web::Json<CredentialVerificationRequest>,
+) -> Result<impl Responder> { ... }
+```
+
+Unlike the `issue_credential` endpoint (which checks an `Authorization: Bearer` header), the verify endpoint is completely open. Any unauthenticated client can:
+
+1. **Enumerate valid credential IDs** by submitting verification requests and observing different error messages ("not found" vs "expired" vs "revoked").
+2. **Exhaust rate limits** by sending repeated verify requests to increment the `presentations_used` counter without needing to hold the actual credential.
+3. **Denial-of-service** legitimate credential holders by burning their presentation quota.
+
+**Also applies to:** `acdp-gateway/acdp-server/src/routes/delegation.rs` — the delegation endpoint also has no auth (though it's unimplemented).
+
+**Recommendation:** Require MCP server authentication (e.g., server-to-server API key or mTLS) on the verify endpoint.
+
+---
+
+## Finding 7: No TLS Minimum Version Enforcement
+
+**Severity:** MEDIUM  
+**Category:** TLS Configuration  
+
+The ACME/TLS setup in `acdp-tui/src/http_server.rs` lines 612-732 uses `rustls-acme` with default TLS configuration:
+
+```rust
+let mut state = acme_config.state();
+let acceptor = state.axum_acceptor(state.default_rustls_config());
+```
+
+`default_rustls_config()` relies on rustls defaults. While rustls is generally safe (no SSL 3.0 or TLS 1.0/1.1), there is:
+
+- No explicit minimum TLS version set (e.g., `TLS 1.3` only).
+- No cipher suite restrictions.
+- No certificate pinning for upstream connections.
+
+The `reqwest` client in `acdp-gateway/acdp-server/src/services/rauthy_client.rs` line 20 uses default configuration:
+
+```rust
+client: reqwest::Client::new(),
+```
+
+This doesn't set `min_tls_version`, doesn't pin certificates, and would accept any valid TLS certificate for the Rauthy server.
+
+**Recommendation:** Set minimum TLS version to 1.3 for the ACME server. For the Rauthy client, consider certificate pinning if the Rauthy instance is self-hosted.
+
+---
+
+## Finding 8: Hardcoded Fallback Secrets and Placeholder Values
+
+**Severity:** MEDIUM  
+**Category:** Hardcoded Secrets  
+
+### 8a. Hardcoded ACME contact email — `acdp-tui/src/http_server.rs` line 636:
+
+```rust
+vec!["mailto:admin@example.com".to_string()]
+```
+
+If no email is configured for TLS/ACME, the system falls back to a fake email address. Let's Encrypt rate-limits by email and domain, and `admin@example.com` may be blacklisted or used by many unrelated systems.
+
+### 8b. Hardcoded default session ID — `acdp-core/src/transport/http_sse.rs` line 1459:
+
+```rust
+self.session_id = Some("default".to_string());
+```
+
+When no session is discovered from a legacy server, the transport falls back to the static string `"default"`. This session ID is predictable and could be used by an attacker to hijack sessions if the server trusts session IDs without validation.
+
+### 8c. All-zeros example signing key — `acdp-gateway/.env.example` line 17:
+
+```
+ACDP_GATEWAY_SIGNING_KEY=0000000000000000000000000000000000000000000000000000000000000000
+```
+
+While this is in an `.env.example` file, if copied as-is to `.env`, the gateway would use the all-zeros key for signing, which is a well-known weak key.
+
+**Recommendation:** Remove the default ACME email fallback (fail loudly instead). Reject weak/all-zeros signing keys at startup. Use cryptographically random session IDs instead of `"default"`.
+
+---
+
+## Finding 9: Rauthy Client Validation Bypass — Always Returns `true`
+
+**Severity:** CRITICAL  
+**Category:** Authentication Bypass  
+
+`acdp-gateway/acdp-server/src/services/rauthy_client.rs` lines 60-69:
+
+```rust
+pub async fn validate_client(
+    &self,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<bool> {
+    // TODO: Implement client validation via Rauthy API
+    Ok(true) // Placeholder
+}
+```
+
+The `validate_client` method is a **stub that always returns `Ok(true)`**, meaning any client ID and secret combination is accepted as valid. While this method may not be called in all code paths today, it represents a **latent auth bypass** — any future code that relies on it for access control will be ineffective.
+
+Additionally, `verify_id_token()` (lines 25-35) always returns an error, meaning ID token verification is completely non-functional:
+
+```rust
+pub async fn verify_id_token(&self, id_token: &str) -> Result<IDTokenClaims> {
+    Err(ACDPGatewayError::RauthyError(
+        "ID token verification not yet implemented".to_string(),
+    ))
+}
+```
+
+**Recommendation:** Implement actual Rauthy token introspection. Remove the `Ok(true)` stub immediately or mark it as `unimplemented!()` to prevent accidental use.
+
+---
+
+## Finding 10: No Security Headers on Any HTTP Response
+
+**Severity:** MEDIUM  
+**Category:** Missing Security Headers  
+
+None of the HTTP servers set any security headers. The following headers are **completely absent** from all responses across all server implementations:
+
+| Header | Purpose |
+|--------|---------|
+| `X-Content-Type-Options: nosniff` | Prevent MIME type sniffing |
+| `X-Frame-Options: DENY` | Prevent clickjacking |
+| `Strict-Transport-Security` | Enforce HTTPS (HSTS) |
+| `Content-Security-Policy` | Prevent XSS |
+| `X-XSS-Protection` | Legacy XSS protection |
+| `Referrer-Policy` | Control referrer leakage |
+| `Permissions-Policy` | Restrict browser features |
+| `Cache-Control: no-store` | Prevent caching of credentials |
+
+**Affected files:**
+- `acdp-gateway/acdp-server/src/main.rs` — only has `Logger` and `Compress` middleware
+- `acdp-tui/src/http_server.rs` — no middleware at all
+- `acdp-transport/src/http_sse_server.rs` — no middleware at all
+- `acdp-transport/src/http_stream_server.rs` — no middleware at all
+
+**Recommendation:** Add a security headers middleware to all HTTP servers. For Actix, use `actix-web-security-headers`. For Axum, use `tower-http`'s `SetResponseHeader` layer. At minimum, add `X-Content-Type-Options`, `X-Frame-Options`, and `Cache-Control: no-store` on credential responses.
+
+---
+
+## Finding 11: Signature Data Mismatch Between Issuance and Verification
+
+**Severity:** HIGH  
+**Category:** Cryptographic Weakness  
+
+The `CredentialService` in `acdp-gateway/acdp-server/src/services/credential.rs` signs identity-bound credentials with a different data format than what `IdentityBoundCredential::verify_signature()` in `acdp-auth/src/credentials.rs` expects.
+
+### Issuance signing data (credential.rs lines 152-156):
+
+```rust
+let mut signing_data = Vec::new();
+signing_data.extend_from_slice(b"ACDP-v0.3");
+signing_data.extend_from_slice(credential_id.as_bytes());
+signing_data.extend_from_slice(&issued_at.timestamp().to_le_bytes());
+signing_data.extend_from_slice(&expires_at.timestamp().to_le_bytes());
+```
+
+### Verification signing data (credentials.rs lines 183-204):
+
+```rust
+fn signing_data(&self) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.extend_from_slice(self.version.as_bytes());  // "0.3" not "ACDP-v0.3"
+    data.extend_from_slice(self.credential_id.as_bytes());
+    data.extend_from_slice(&self.issued_at.timestamp().to_le_bytes());
+    data.extend_from_slice(&self.expires_at.timestamp().to_le_bytes());
+    let canonical = serde_json::to_vec(&(
+        &self.principal, &self.agent, &self.mcp_capabilities, &self.delegation,
+    ))?;
+    data.extend_from_slice(&canonical);
+    Ok(data)
+}
+```
+
+**Differences:**
+1. Issuance uses `b"ACDP-v0.3"` (9 bytes); verification uses `self.version.as_bytes()` which is `"0.3"` (3 bytes).
+2. Verification includes `principal`, `agent`, `mcp_capabilities`, and `delegation` in the signing data; issuance **omits all of these**.
+
+This means **signature verification will always fail** for credentials issued by the gateway service, effectively making the verification endpoint unable to cryptographically validate any credential.
+
+For hybrid credentials, the issuance signing data is even shorter (only `b"ACDP-v0.3"` + credential_id, without timestamps), further diverging from the verification format.
+
+In the `acdp-auth` gateway, the `sign_credential` method signs **only the credential UUID** (16 bytes):
+
+```rust
+fn sign_credential(&self, credential_id: &Uuid) -> Result<Signature> {
+    let data = credential_id.as_bytes();
+    Ok(self.keypair.sk.sign(data, None))
+}
+```
+
+This means the signature covers none of the credential's security-critical fields (principal, agent, capabilities, expiration), allowing any of those to be tampered with.
+
+**Recommendation:** Unify the signing data format between issuance and verification. Both must use the identical canonicalization that includes all security-critical fields.
+
+---
+
+## Finding 12: ID-JAG JWT Validation Disables Standard Checks
+
+**Severity:** MEDIUM  
+**Category:** JWT Validation Weakness  
+
+`acdp-auth/src/mcp.rs` lines 144-146:
+
+```rust
+let mut validation = Validation::default();
+validation.validate_exp = false;
+validation.validate_aud = false;
+```
+
+The `IDJAGToken::decode()` method disables both expiration and audience validation during JWT decoding. While the code comments claim these are "validated manually" via the `verify()` method, this creates a window where expired or misaddressed tokens are accepted if `decode()` is called without a subsequent `verify()` call.
+
+In the `id_jag.rs` service (`acdp-gateway/acdp-server`), the `validate_id_jag()` function correctly enables `validate_exp = true` and sets the audience. However, the `IDJAGToken::decode()` method in the auth library does not, which means any code using the library directly (including the gateway binary at `acdp-auth/src/bin/gateway.rs`) may accept expired/misaddressed tokens.
+
+Additionally, `Validation::default()` uses HS256 as the default algorithm, meaning the `jsonwebtoken` crate will reject tokens signed with RSA/EC unless explicitly configured. This is correct for the current `DecodingKey::from_secret()` usage, but will break when real IdP keys (typically RS256/ES256) are used.
+
+**Recommendation:** Never disable standard JWT validation checks. If manual validation is needed, perform it *before* accepting the token. Configure the algorithm list to match the expected IdP signing algorithm.
+
+---
+
+## Summary of Findings
+
+| # | Finding | Severity | Category |
+|---|---------|----------|----------|
+| 1 | No CORS configuration on any HTTP server | HIGH | CORS |
+| 2 | No CSRF protection on state-changing endpoints | HIGH | CSRF |
+| 3 | Weak RNG in proxy name generation | LOW | RNG |
+| 4 | ARC server private key not persisted | HIGH | Key Management |
+| 5 | Timing side-channel in crypto comparisons | MEDIUM | Side-Channel |
+| 6 | Verify/delegate endpoints have no authentication | HIGH | Auth Bypass |
+| 7 | No TLS minimum version enforcement | MEDIUM | TLS |
+| 8 | Hardcoded fallback secrets and placeholders | MEDIUM | Secrets |
+| 9 | Rauthy `validate_client` always returns true | CRITICAL | Auth Bypass |
+| 10 | No security headers on any HTTP response | MEDIUM | Headers |
+| 11 | Signature data mismatch between issuance/verification | HIGH | Crypto |
+| 12 | ID-JAG JWT decode disables exp/aud validation | MEDIUM | JWT |
+
+---
+
+*Report generated by automated security audit on 2026-07-02.*
